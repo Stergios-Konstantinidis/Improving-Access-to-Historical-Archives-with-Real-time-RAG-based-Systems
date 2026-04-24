@@ -1,0 +1,22 @@
+# Configuration for RAG evaluation with k=20
+
+# Run identification
+run_name: "our_pipeline_reranker_HNSW_k20_neutral"
+
+# Data paths
+questions_csv_path: "data/evaluation_questions_neutral.csv"
+
+# RAG endpoint configuration
+rag_endpoint: "http://192.168.1.171/get_answer"
+
+# Retrieval parameters
+top_k: 20
+fetch_k: 50
+reranker_name: "HNSW"
+
+# Model metadata
+model_name: "rag_v1"
+prompt_version: "v1"
+
+# Output configuration
+output_dir: "runs"

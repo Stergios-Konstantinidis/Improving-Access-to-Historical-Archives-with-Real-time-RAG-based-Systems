@@ -1,0 +1,22 @@
+# New Evaluation Setup - Requirements
+# ====================================
+# Dependencies for the evaluation framework
+
+# Core dependencies
+numpy>=1.24.0
+pandas>=2.0.0
+requests>=2.28.0
+pyyaml>=6.0
+
+# OpenAI for embeddings and LLM calls
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# RAGAS for reference-free metrics
+ragas>=0.1.0
+datasets>=2.14.0
+langchain-openai>=0.0.5
+
+# Reranking with Cross-Encoder -->not necessary if using colab notebook (CF README.md)
+# sentence-transformers>=2.2.0
+# torch>=2.0.0

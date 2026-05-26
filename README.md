@@ -1,7 +1,5 @@
 # Improving Access to Historical Archives with Real-time RAG-based Systems
 
-> **Paper submitted to *Information Processing & Management***
-
 ## Overview
 
 This repository accompanies the paper *"Improving Access to Historical Archives with Real-time RAG-based Systems"*, which presents an end-to-end archival processing and retrieval framework that integrates large language models (LLMs) into the data ingestion and query pipeline of digitized historical archives.
@@ -154,7 +152,7 @@ An immersive archive exploration interface was deployed on an **Apple Vision Pro
 ```bibtex
 @article{improving_access_historical_archives_2026,
   title={Improving Access to Historical Archives with Real-time RAG-based Systems},
-  journal={Information Processing \& Management},
+  journal={Journal of the Association for Information Science and Technology},
   year={2026},
   note={Under review}
 }

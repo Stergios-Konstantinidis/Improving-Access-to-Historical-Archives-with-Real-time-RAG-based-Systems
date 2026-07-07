@@ -569,7 +569,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bm25-top-k",
         type=int,
-        default=50,
+        default=100,
         help="Nombre de chunks BM25 à ajouter à la suite",
     )
     parser.add_argument(

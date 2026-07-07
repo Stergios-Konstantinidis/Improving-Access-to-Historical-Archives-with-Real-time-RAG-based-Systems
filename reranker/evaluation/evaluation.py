@@ -126,6 +126,10 @@ CONFIG = {
     "evaluation_enable_dedup": env_bool("EVALUATION_ENABLE_DEDUP", True),
     "warmup_runs": env_int("EVALUATION_WARMUP_RUNS", 1),
 
+    # Logging
+    "verbose": env_bool("EVALUATION_VERBOSE", False),
+    "progress_postfix": env_bool("EVALUATION_PROGRESS_POSTFIX", True),
+
     # Reranker config
     "rerank_config": {
         "model_name": env_str("EVALUATION_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"),
@@ -136,12 +140,12 @@ CONFIG = {
         "window_overlap": env_int("EVALUATION_RERANK_WINDOW_OVERLAP", 200),
         "min_window_chars": env_int("EVALUATION_RERANK_MIN_WINDOW_CHARS", 50),
         "agg": env_str("EVALUATION_RERANK_AGG", "softmax_topk"),
-        "topk_windows": env_int("EVALUATION_RERANK_TOPK_WINDOWS", 3),
+        "topk_windows": env_int("EVALUATION_RERANK_TOPK_WINDOWS", 10),
         "softmax_temp": env_float("EVALUATION_RERANK_SOFTMAX_TEMP", 0.25),
         "normalize_whitespace": env_bool("EVALUATION_RERANK_NORMALIZE_WHITESPACE", False),
-        "return_spans": env_bool("EVALUATION_RERANK_RETURN_SPANS", False),
         "add_scores_to_metadata": env_bool("EVALUATION_RERANK_ADD_SCORES_TO_METADATA", True),
         "use_metadata": env_bool("EVALUATION_RERANK_USE_METADATA", True),
+        "verbose": env_bool("EVALUATION_RERANK_VERBOSE", False),
     },
 
     # Generation
@@ -473,7 +477,7 @@ def warmup_pipeline(
             run_file_path=CONFIG["run_file_path"],
             question_id=qid,
             generate_embeddings=CONFIG["generate_embeddings"],
-            verbose=True,
+            verbose=CONFIG["verbose"],
             return_timing=False,
         )
 
@@ -502,7 +506,15 @@ def run_pipeline(
         print("\n[RERANK CONFIG - EFFECTIVE]")
         print(json.dumps(asdict(rerank_cfg), ensure_ascii=False, indent=2) if rerank_cfg else "rerank_cfg=None")
 
-    for row in tqdm(questions, desc=("with_rerank" if use_reranker else "no_rerank")):
+    progress = tqdm(
+        questions,
+        desc=("with_rerank" if use_reranker else "no_rerank"),
+        unit="q",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+    for row in progress:
         qid = row["question_id"]
         q = row["question"]
 
@@ -521,7 +533,7 @@ def run_pipeline(
             run_file_path=CONFIG["run_file_path"],
             question_id=qid,
             generate_embeddings=CONFIG["generate_embeddings"],
-            verbose=True,
+            verbose=CONFIG["verbose"],
             return_timing=True,
         )
 
@@ -542,24 +554,26 @@ def run_pipeline(
         dists = res.get("distances", [[]])[0] or []
 
         non_empty = sum(1 for d in docs if (d or "").strip())
-        print(f"\n[{qid}] Retrieved docs: total={len(docs)} non_empty={non_empty}")
 
-        for i in range(min(3, len(docs))):
-            preview = (docs[i] or "").replace("\n", " ")[:200]
+        if CONFIG["verbose"]:
+            tqdm.write(f"\n[{qid}] Retrieved docs: total={len(docs)} non_empty={non_empty}")
 
-            meta = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
-            meta_keys = list(meta.keys())[:10]
+            for i in range(min(3, len(docs))):
+                preview = (docs[i] or "").replace("\n", " ")[:200]
 
-            meta_debug = {
-                "id": meta.get("id"),
-                "year": meta.get("year") or meta.get("Year"),
-                "date": meta.get("date") or meta.get("Date"),
-                "topic": meta.get("topic") or meta.get("Topic"),
-                "organization": meta.get("organization") or meta.get("Organization"),
-                "meta_keys": meta_keys,
-            }
+                meta = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
+                meta_keys = list(meta.keys())[:10]
 
-            print(f"  - doc[{i}] meta_debug={meta_debug} preview='{preview}…'")
+                meta_debug = {
+                    "id": meta.get("id"),
+                    "year": meta.get("year") or meta.get("Year"),
+                    "date": meta.get("date") or meta.get("Date"),
+                    "topic": meta.get("topic") or meta.get("Topic"),
+                    "organization": meta.get("organization") or meta.get("Organization"),
+                    "meta_keys": meta_keys,
+                }
+
+                tqdm.write(f"  - doc[{i}] meta_debug={meta_debug} preview='{preview}…'")
 
         if CONFIG["generate_embeddings"]:
             ans, gen_ms = generate_answer(client, q, docs, metas)
@@ -567,12 +581,23 @@ def run_pipeline(
             ans = ""
             gen_ms = 0.0
 
-        print(
-            f"  -> timings: retrieval={retrieval_ms:.2f} ms | "
-            f"rerank={rerank_ms:.2f} ms | "
-            f"generation={gen_ms:.2f} ms | "
-            f"total={retrieval_ms + gen_ms:.2f} ms"
-        )
+        total_ms = retrieval_ms + gen_ms
+
+        if CONFIG["verbose"]:
+            tqdm.write(
+                f"  -> timings: retrieval={retrieval_ms:.2f} ms | "
+                f"rerank={rerank_ms:.2f} ms | "
+                f"generation={gen_ms:.2f} ms | "
+                f"total={total_ms:.2f} ms"
+            )
+        elif CONFIG["progress_postfix"]:
+            progress.set_postfix(
+                qid=qid,
+                docs=len(docs),
+                non_empty=non_empty,
+                rerank_ms=f"{rerank_ms:.0f}",
+                total_ms=f"{total_ms:.0f}",
+            )
 
         record = {
             "question_id": qid,
@@ -616,11 +641,26 @@ def run_pipeline(
     dump_jsonl(generations_path, out)
 
     if use_reranker:
+        # Export principal :
+        # - si --output est donné, écrit dans ce fichier
+        # - sinon, écrit dans data/reranker/runs/<model>_<timestamp>.jsonl
         export_path = build_export_generation_path()
         ensure_dir(export_path.parent)
         dump_jsonl(export_path, out)
         print(f"Exported generations to: {export_path}")
 
+        # Copie historique toujours conservée dans data/reranker/runs
+        model_name = CONFIG["rerank_config"]["model_name"]
+        safe_model_name = sanitize_filename(model_name)
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        legacy_export_path = Path(CONFIG["export_dir"]) / f"{safe_model_name}_{date_str}.jsonl"
+
+        # Évite d'écrire deux fois le même fichier si --output n'est pas utilisé
+        if legacy_export_path.resolve() != export_path.resolve():
+            ensure_dir(legacy_export_path.parent)
+            dump_jsonl(legacy_export_path, out)
+            print(f"Also exported legacy runs copy to: {legacy_export_path}")
     return out
 
 
@@ -693,8 +733,21 @@ def evaluate_runs(
 # ----------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Lance l'évaluation du reranker avec un chemin d'export optionnel."
+        description="Lance l'évaluation du reranker avec un chemin d'entrée et un chemin d'export optionnels."
     )
+
+    parser.add_argument(
+        "--input",
+        "--input-jsonl",
+        dest="input",
+        type=str,
+        default=None,
+        help=(
+            "Fichier JSONL d'entrée contenant les questions et retrieved_chunks. "
+            "Si fourni, il remplace CONFIG['questions_jsonl'] et CONFIG['run_file_path']."
+        ),
+    )
+
     parser.add_argument(
         "-o",
         "--output",
@@ -706,6 +759,7 @@ def parse_args():
             "traité comme un dossier d'export."
         ),
     )
+
     return parser.parse_args()
 
 
@@ -714,6 +768,15 @@ def parse_args():
 # ----------------------------
 def main():
     args = parse_args()
+
+    if args.input is not None and args.input.strip() != "":
+        input_path = Path(args.input)
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input JSONL introuvable : {input_path}")
+
+        CONFIG["questions_jsonl"] = input_path
+        CONFIG["run_file_path"] = input_path
 
     runtime = detect_backend_and_device()
 

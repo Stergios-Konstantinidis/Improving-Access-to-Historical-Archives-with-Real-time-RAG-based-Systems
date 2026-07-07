@@ -538,7 +538,20 @@ def get_relating_documents_bis(
             md["cross_score"] = float(scores[i])
 
         if spans is not None and i < len(spans) and spans[i] is not None:
-            md["best_span"] = {"start_char": int(spans[i][0]), "end_char": int(spans[i][1])}
+            span = spans[i]
+            start = int(span[0])
+            end = int(span[1])
+
+            md["best_span"] = {
+                "start_char": start,
+                "end_char": end,
+                "source": "prepared_text",
+            }
+
+            # Important avec use_metadata=True :
+            # ce texte est la fenêtre exacte scorée par le reranker.
+            if len(span) >= 3 and isinstance(span[2], str):
+                md["best_span_text"] = span[2].strip()
 
         new_metas.append(md)
 

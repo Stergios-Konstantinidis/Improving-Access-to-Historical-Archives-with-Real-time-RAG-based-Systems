@@ -16,6 +16,7 @@ DocumentInput = Union[str, Dict[str, Any]]
 @dataclass
 class RerankConfig:
     model_name: str = DEFAULT_MODEL
+    verbose: bool = False
     batch_size: int = 32
     device: Optional[str] = None  # "mps" / "cuda" / "cpu" / None
     backend: str = "torch"
@@ -42,7 +43,7 @@ class RerankConfig:
     add_scores_to_metadata: bool = True
 
     # metadata
-    use_metadata: bool = False
+    use_metadata: bool = True
     metadata_max_chars: int = 500
 
     # fixed whitelist
@@ -332,7 +333,8 @@ def rerank_with_spans(
     cfg = config or RerankConfig()
     model = _get_model(cfg.model_name, cfg.device, cfg.backend)
 
-    print(f"[RERANK] effective backend={cfg.backend}")
+    if getattr(cfg, "verbose", False):
+        print(f"[RERANK] effective backend={cfg.backend}")
 
     q = _clean_text(query, cfg.normalize_whitespace)
 
@@ -340,7 +342,7 @@ def rerank_with_spans(
     short_map: List[int] = []
 
     win_pairs: List[Tuple[str, str]] = []
-    win_map: List[Tuple[int, int, int]] = []  # (doc_i, start, end)
+    win_map: List[Tuple[int, int, int, str]] = []  # (doc_i, start, end, window_text)
 
     for i, d in enumerate(docs):
         if isinstance(d, str):
@@ -359,7 +361,7 @@ def rerank_with_spans(
         else:
             for s, e, wtxt in _make_windows(prepared, cfg):
                 win_pairs.append((q, wtxt))
-                win_map.append((i, s, e))
+                win_map.append((i, s, e, wtxt))
 
     doc_scores = [float("-inf")] * len(docs)
     spans = [None] * len(docs) if cfg.return_spans else None
@@ -400,23 +402,23 @@ def rerank_with_spans(
                 raise
 
         per_doc: Dict[int, List[float]] = {}
-        per_doc_best: Dict[int, Tuple[float, int, int]] = {}
+        per_doc_best: Dict[int, Tuple[float, int, int, str]] = {}
 
-        for (doc_i, s, e), sc in zip(win_map, win_scores):
+        for (doc_i, s, e, wtxt), sc in zip(win_map, win_scores):
             scf = float(sc)
             per_doc.setdefault(doc_i, []).append(scf)
 
             prev = per_doc_best.get(doc_i)
             if cfg.return_spans and (prev is None or scf > prev[0]):
-                per_doc_best[doc_i] = (scf, s, e)
+                per_doc_best[doc_i] = (scf, s, e, wtxt)
 
         for doc_i, arr_list in per_doc.items():
             agg_score = _aggregate(np.asarray(arr_list, dtype=float), cfg)
             doc_scores[doc_i] = float(agg_score)
 
             if cfg.return_spans and spans is not None and doc_i in per_doc_best:
-                _, s, e = per_doc_best[doc_i]
-                spans[doc_i] = (s, e)
+                _, s, e, wtxt = per_doc_best[doc_i]
+                spans[doc_i] = (s, e, wtxt)
 
     return doc_scores, spans
 

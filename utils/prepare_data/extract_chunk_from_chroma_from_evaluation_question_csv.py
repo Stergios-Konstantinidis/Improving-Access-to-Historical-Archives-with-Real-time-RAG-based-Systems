@@ -1,6 +1,8 @@
 # extract_chunk_from_chroma_from_evaluation_question_csv.py
+import argparse
 import json
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -15,21 +17,64 @@ from chromadb.utils.embedding_functions import (
     GoogleGenerativeAiEmbeddingFunction,
 )
 
+try:
+    from google.api_core import exceptions as google_exceptions
+except Exception:  # pragma: no cover - utile si le provider Google n'est pas installé
+    google_exceptions = None
+
 load_dotenv()
 
 # =============================
 # Paths
 # =============================
+# =============================
+# Paths + CLI
+# =============================
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-CSV_PATH = PROJECT_ROOT / "data" / "evaluation_questions.csv"
-OUTPUT_FILE = PROJECT_ROOT / "data" / "baseline" / "generations.jsonl"
+DEFAULT_CSV_PATH = PROJECT_ROOT / "data" / "evaluation_questions.csv"
+DEFAULT_OUTPUT_FILE = PROJECT_ROOT / "data" / "baseline" / "generations.jsonl"
+DEFAULT_TOP_K = 100
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extract Chroma chunks from evaluation questions CSV."
+    )
+
+    parser.add_argument(
+        "--input-csv",
+        type=Path,
+        default=DEFAULT_CSV_PATH,
+        help="Input CSV containing evaluation questions.",
+    )
+
+    parser.add_argument(
+        "--output-jsonl",
+        type=Path,
+        default=DEFAULT_OUTPUT_FILE,
+        help="Output JSONL file.",
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help="Number of Chroma chunks to retrieve per question.",
+    )
+
+    return parser.parse_args()
+
+
+args = parse_args()
+
+CSV_PATH = args.input_csv
+OUTPUT_FILE = args.output_jsonl
+TOP_K = args.top_k
 
 CHROMA_BASE_PATH = os.getenv("CHROMA_BASE_PATH", "data/chroma")
 COLLECTION_NAME = os.getenv("DEFAULT_CHROMA_INDEX", "chroma_index")
 CHROMA_DIR = (PROJECT_ROOT / ".." / CHROMA_BASE_PATH / COLLECTION_NAME).resolve()
-
-TOP_K = 50
 
 # =============================
 # Env helpers
@@ -51,6 +96,22 @@ if EMBEDDING_REQUESTS_PER_MINUTE <= 0:
     raise ValueError("EMBEDDING_REQUESTS_PER_MINUTE doit être > 0")
 
 MIN_SECONDS_BETWEEN_REQUESTS = 60.0 / EMBEDDING_REQUESTS_PER_MINUTE
+
+# Retry embedding API: stratégie Google "truncated exponential backoff" + jitter.
+# Utile notamment pour les erreurs 429 / RESOURCE_EXHAUSTED.
+EMBEDDING_MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", "8"))
+EMBEDDING_INITIAL_BACKOFF_SECONDS = float(os.getenv("EMBEDDING_INITIAL_BACKOFF_SECONDS", "1.0"))
+EMBEDDING_MAX_BACKOFF_SECONDS = float(os.getenv("EMBEDDING_MAX_BACKOFF_SECONDS", "64.0"))
+EMBEDDING_RETRY_DEADLINE_SECONDS = float(os.getenv("EMBEDDING_RETRY_DEADLINE_SECONDS", "300.0"))
+
+if EMBEDDING_MAX_RETRIES < 0:
+    raise ValueError("EMBEDDING_MAX_RETRIES doit être >= 0")
+if EMBEDDING_INITIAL_BACKOFF_SECONDS <= 0:
+    raise ValueError("EMBEDDING_INITIAL_BACKOFF_SECONDS doit être > 0")
+if EMBEDDING_MAX_BACKOFF_SECONDS <= 0:
+    raise ValueError("EMBEDDING_MAX_BACKOFF_SECONDS doit être > 0")
+if EMBEDDING_RETRY_DEADLINE_SECONDS <= 0:
+    raise ValueError("EMBEDDING_RETRY_DEADLINE_SECONDS doit être > 0")
 
 
 class RateLimiter:
@@ -118,6 +179,135 @@ def build_embedding_function():
     )
 
 
+def is_retryable_embedding_error(exc: Exception) -> bool:
+    """
+    Erreurs transitoires à retenter.
+    Couvre Google 429 RESOURCE_EXHAUSTED et quelques erreurs réseau/serveur.
+    """
+    if google_exceptions is not None:
+        retryable_google_errors = tuple(
+            cls
+            for cls in (
+                getattr(google_exceptions, "ResourceExhausted", None),
+                getattr(google_exceptions, "ServiceUnavailable", None),
+                getattr(google_exceptions, "DeadlineExceeded", None),
+                getattr(google_exceptions, "InternalServerError", None),
+                getattr(google_exceptions, "TooManyRequests", None),
+            )
+            if cls is not None
+        )
+        if retryable_google_errors and isinstance(exc, retryable_google_errors):
+            return True
+
+    # Fallback générique, utile si l'exception vient d'une dépendance différente.
+    class_name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+
+    retryable_names = (
+        "ratelimit",
+        "toomanyrequests",
+        "resourceexhausted",
+        "serviceunavailable",
+        "deadlineexceeded",
+        "timeout",
+        "temporarilyunavailable",
+    )
+
+    retryable_messages = (
+        "429",
+        "resource exhausted",
+        "too many requests",
+        "rate limit",
+        "quota",
+        "try again later",
+        "temporarily unavailable",
+        "deadline exceeded",
+        "service unavailable",
+    )
+
+    return any(x in class_name for x in retryable_names) or any(
+        x in message for x in retryable_messages
+    )
+
+
+def compute_retry_sleep_seconds(attempt_index: int) -> float:
+    """
+    Backoff exponentiel tronqué avec jitter.
+    attempt_index commence à 0 pour le premier retry après le premier échec.
+    Exemple: 1+jitter, 2+jitter, 4+jitter, ... plafonné à EMBEDDING_MAX_BACKOFF_SECONDS.
+    """
+    exponential_wait = EMBEDDING_INITIAL_BACKOFF_SECONDS * (2 ** attempt_index)
+    jitter = random.random()  # fraction aléatoire entre 0 et 1
+    return min(exponential_wait + jitter, EMBEDDING_MAX_BACKOFF_SECONDS)
+
+
+def call_embedding_with_retry(
+    embedding_fn,
+    text: str,
+    rate_limiter: RateLimiter,
+) -> Tuple[Any, Dict[str, float]]:
+    """
+    Appelle embedding_fn([text]) avec retry sur erreurs transitoires.
+    Retourne l'embedding brut + timings détaillés.
+    """
+    attempts = 0
+    total_rate_limit_wait_ms = 0.0
+    total_embedding_api_ms = 0.0
+    total_retry_sleep_ms = 0.0
+    retry_started_at = time.monotonic()
+
+    while True:
+        attempts += 1
+
+        wait_seconds = rate_limiter.wait()
+        total_rate_limit_wait_ms += wait_seconds * 1000
+
+        embedding_api_start = time.perf_counter()
+        try:
+            embedding = embedding_fn([text])
+            total_embedding_api_ms += (time.perf_counter() - embedding_api_start) * 1000
+
+            timing = {
+                "rate_limit_wait_ms": round(total_rate_limit_wait_ms, 2),
+                "embedding_api_ms": round(total_embedding_api_ms, 2),
+                "embedding_retry_sleep_ms": round(total_retry_sleep_ms, 2),
+                "embedding_attempts": attempts,
+            }
+            return embedding, timing
+
+        except Exception as exc:
+            total_embedding_api_ms += (time.perf_counter() - embedding_api_start) * 1000
+
+            if not is_retryable_embedding_error(exc):
+                raise
+
+            retries_done = attempts - 1
+            elapsed = time.monotonic() - retry_started_at
+
+            if retries_done >= EMBEDDING_MAX_RETRIES:
+                raise RuntimeError(
+                    f"Embedding API échoué après {attempts} tentative(s) "
+                    f"({EMBEDDING_MAX_RETRIES} retry max). Dernière erreur: {exc}"
+                ) from exc
+
+            sleep_seconds = compute_retry_sleep_seconds(retries_done)
+
+            if elapsed + sleep_seconds > EMBEDDING_RETRY_DEADLINE_SECONDS:
+                raise RuntimeError(
+                    f"Embedding API échoué: deadline retry dépassée "
+                    f"({EMBEDDING_RETRY_DEADLINE_SECONDS:.1f}s). "
+                    f"Tentatives effectuées: {attempts}. Dernière erreur: {exc}"
+                ) from exc
+
+            print(
+                "\n[RETRY embedding] "
+                f"tentative {attempts} échouée: {exc.__class__.__name__}: {exc}. "
+                f"Nouvelle tentative dans {sleep_seconds:.2f}s..."
+            )
+            time.sleep(sleep_seconds)
+            total_retry_sleep_ms += sleep_seconds * 1000
+
+
 def extract_query_embedding(
     embedding_fn,
     text: str,
@@ -128,14 +318,11 @@ def extract_query_embedding(
     - l'embedding
     - un dictionnaire de timings en millisecondes
     """
-    # Attente artificielle liée aux tests
-    wait_seconds = rate_limiter.wait()
-    rate_limit_wait_ms = wait_seconds * 1000
-
-    # Temps réel de l'appel embedding
-    embedding_api_start = time.perf_counter()
-    embedding = embedding_fn([text])
-    embedding_api_ms = (time.perf_counter() - embedding_api_start) * 1000
+    embedding, timing = call_embedding_with_retry(
+        embedding_fn=embedding_fn,
+        text=text,
+        rate_limiter=rate_limiter,
+    )
 
     if embedding is None:
         raise ValueError("Embedding vide renvoyé par la fonction d'embedding.")
@@ -159,11 +346,6 @@ def extract_query_embedding(
         raise ValueError(
             f"Format d'embedding inattendu. Type={type(embedding)}, valeur={repr(embedding)[:500]}"
         )
-
-    timing = {
-        "rate_limit_wait_ms": round(rate_limit_wait_ms, 2),
-        "embedding_api_ms": round(embedding_api_ms, 2),
-    }
 
     return final_embedding, timing
 
@@ -202,6 +384,10 @@ print(f"CHROMA_DIR exists = {CHROMA_DIR.exists()}")
 print(f"EMBEDDING_PROVIDER = {EMBEDDING_PROVIDER}")
 print(f"EMBEDDING_REQUESTS_PER_MINUTE = {EMBEDDING_REQUESTS_PER_MINUTE}")
 print(f"MIN_SECONDS_BETWEEN_REQUESTS = {MIN_SECONDS_BETWEEN_REQUESTS:.3f}")
+print(f"EMBEDDING_MAX_RETRIES = {EMBEDDING_MAX_RETRIES}")
+print(f"EMBEDDING_INITIAL_BACKOFF_SECONDS = {EMBEDDING_INITIAL_BACKOFF_SECONDS:.3f}")
+print(f"EMBEDDING_MAX_BACKOFF_SECONDS = {EMBEDDING_MAX_BACKOFF_SECONDS:.3f}")
+print(f"EMBEDDING_RETRY_DEADLINE_SECONDS = {EMBEDDING_RETRY_DEADLINE_SECONDS:.3f}")
 
 if not CHROMA_DIR.exists():
     raise ValueError(f"Le dossier Chroma n'existe pas: {CHROMA_DIR}")
@@ -304,6 +490,8 @@ with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             "latency_ms": {
                 "rate_limit_wait_ms": embedding_timing["rate_limit_wait_ms"],
                 "embedding_api_ms": embedding_timing["embedding_api_ms"],
+                "embedding_retry_sleep_ms": embedding_timing.get("embedding_retry_sleep_ms", 0.0),
+                "embedding_attempts": embedding_timing.get("embedding_attempts", 1),
                 "chroma_query_ms": round(chroma_query_ms, 2),
                 "real_pipeline_ms": round(real_pipeline_ms, 2),
             },

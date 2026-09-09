@@ -67,7 +67,7 @@ Experiments were conducted on a **proprietary curated subset of historical newsp
 | **Temporal coverage** | 1762 through 2001 |
 | **Segments** | 500,000 curated article segments with structured metadata (dates, bounding boxes, NER, summaries) |
 | **Queries** | 384 manually formulated natural-language queries |
-| **OCR Ground Truth** | 94 manually transcribed document snippets |
+| **OCR Ground Truth** | ~700 manually transcribed document snippets |
 
 ---
 
